@@ -102,3 +102,57 @@ def upload(path, name, mime_type=None, progress_cb=None):
     if progress_cb:
         progress_cb(total, total)
     return response
+
+
+def _list_folder(service, folder_id, trashed):
+    """All files directly inside folder_id, active or trashed, paginated."""
+    files, page_token = [], None
+    q = f"'{folder_id}' in parents and trashed = {'true' if trashed else 'false'}"
+    while True:
+        resp = service.files().list(
+            q=q,
+            fields="nextPageToken, files(id, name)",
+            pageSize=200,
+            spaces="drive",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+            pageToken=page_token,
+        ).execute()
+        files.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+
+def count_wipe_targets(folder_id):
+    """How many files a wipe would touch: active in the folder + trashed from it."""
+    service = build_service()
+    active = _list_folder(service, folder_id, trashed=False)
+    trashed = _list_folder(service, folder_id, trashed=True)
+    return len(active) + len(trashed)
+
+
+def wipe_folder(folder_id, progress_cb=None):
+    """Permanently delete every file in folder_id, including ones already in
+    the trash that originated there. Scoped to this folder only - never
+    touches the account-wide trash, so files outside it are untouched.
+
+    Runs blocking, so callers on the event loop should hand it to a thread.
+    """
+    service = build_service()
+    targets = _list_folder(service, folder_id, trashed=False) + _list_folder(
+        service, folder_id, trashed=True
+    )
+
+    deleted, errors = 0, []
+    for i, f in enumerate(targets, 1):
+        try:
+            service.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
+            deleted += 1
+        except HttpError as exc:
+            errors.append(f"{f.get('name', f['id'])}: {exc}")
+        if progress_cb:
+            progress_cb(i, len(targets))
+
+    return {"total": len(targets), "deleted": deleted, "errors": errors}

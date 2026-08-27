@@ -116,6 +116,27 @@ sudo systemctl enable --now drive-bot
 journalctl -u drive-bot -f
 ```
 
+## Wiping the Drive folder
+
+`/wipe` permanently deletes every file in `DRIVE_FOLDER_ID`, plus anything
+already sitting in the trash that originated from that folder. It calls
+`files.delete()` per file, which skips the trash entirely — this is not a
+"move to bin" that you could later recover from Drive's trash UI.
+
+Scope is deliberately narrow: it only ever queries `'{DRIVE_FOLDER_ID}' in
+parents`, never a whole-account trash purge (`files.emptyTrash`), so files
+elsewhere in your Drive are never touched even in the trashed state — that
+also means it works within the existing `drive.file` OAuth scope, no
+re-consent needed.
+
+Two-step by design:
+```
+/wipe            -> counts targets, warns, does nothing yet
+/wipe confirm    -> actually deletes
+```
+Refuses outright if `DRIVE_FOLDER_ID` is unset, rather than touching My Drive
+root. Gated by the same `ALLOWED_USERS` / `ALLOWED_CHATS` check as uploads.
+
 ## Disk
 
 The whole file lands on disk before the upload starts, so you need

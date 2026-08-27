@@ -209,7 +209,8 @@ async def on_start(event):
         "Send me a file and I'll put it in Google Drive.\n\n"
         f"- up to {human(config.BOT_DOWNLOAD_LIMIT)}: send it here directly\n"
         "- larger: post it in a group I share with the linked user account\n\n"
-        "/id - show your Telegram user id"
+        "/id - show your Telegram user id\n"
+        "/wipe - permanently delete everything in the Drive folder (and its trash)"
     )
 
 
@@ -218,18 +219,87 @@ async def on_id(event):
     await event.reply(f"Your user id: `{event.sender_id}`\nChat id: `{event.chat_id}`")
 
 
+def is_trusted(event):
+    return event.sender_id in config.ALLOWED_USERS or event.chat_id in config.ALLOWED_CHATS
+
+
+async def reply_not_authorised(event):
+    log.warning(
+        "rejected: sender_id=%r chat_id=%r; ALLOWED_USERS=%r ALLOWED_CHATS=%r",
+        event.sender_id, event.chat_id, config.ALLOWED_USERS, config.ALLOWED_CHATS,
+    )
+    await event.reply(
+        f"Not authorised.\nYour id: `{event.sender_id}`\nThis chat's id: `{event.chat_id}`\n"
+        "Add one of those to ALLOWED_USERS or ALLOWED_CHATS and restart the bot."
+    )
+
+
+@bot.on(events.NewMessage(pattern=r"^/wipe(?:\s+(\S+))?$"))
+async def on_wipe(event):
+    if not is_trusted(event):
+        await reply_not_authorised(event)
+        return
+    if not config.DRIVE_FOLDER_ID:
+        await event.reply(
+            "DRIVE_FOLDER_ID is not set in .env - refusing to wipe My Drive root."
+        )
+        return
+
+    confirmed = (event.pattern_match.group(1) or "").lower() == "confirm"
+    if not confirmed:
+        status = await event.reply("Checking folder...")
+        try:
+            count = await asyncio.to_thread(drive.count_wipe_targets, config.DRIVE_FOLDER_ID)
+        except Exception as exc:
+            log.exception("wipe count failed")
+            await status.edit(f"Could not check the folder: {exc}")
+            return
+        if count == 0:
+            await status.edit("Folder (and its trash) is already empty. Nothing to do.")
+            return
+        await status.edit(
+            f"This will **permanently** delete {count} file(s) from the Drive "
+            "folder, including anything already trashed from it. This cannot "
+            "be undone.\n\nSend `/wipe confirm` to proceed."
+        )
+        return
+
+    status = await event.reply("Wiping folder...")
+    prog = Progress()
+    stop = asyncio.Event()
+    tick = asyncio.create_task(ticker(status, prog, "Wiping Drive folder", stop))
+    try:
+        prog.begin("deleting", 0)
+        loop = asyncio.get_running_loop()
+
+        def on_progress(done, total):
+            loop.call_soon_threadsafe(prog.update, done, total)
+
+        result = await asyncio.to_thread(drive.wipe_folder, config.DRIVE_FOLDER_ID, on_progress)
+    except Exception as exc:
+        log.exception("wipe failed")
+        stop.set()
+        await tick
+        await status.edit(f"**Wipe failed**\n`{type(exc).__name__}`\n{exc}")
+        return
+    else:
+        stop.set()
+        await tick
+
+    lines = [f"Deleted {result['deleted']}/{result['total']} file(s)."]
+    if result["errors"]:
+        log.warning("wipe errors: %s", result["errors"])
+        lines.append(f"{len(result['errors'])} failed:")
+        lines.extend(f"- {e}" for e in result["errors"][:10])
+        if len(result["errors"]) > 10:
+            lines.append(f"...and {len(result['errors']) - 10} more (see logs).")
+    await status.edit("\n".join(lines))
+
+
 @bot.on(events.NewMessage(func=lambda e: e.file is not None))
 async def on_file(event):
-    if event.sender_id not in config.ALLOWED_USERS:
-        log.warning("rejected file from %s", event.sender_id)
-        log.warning(
-            "rejected file from sender_id=%r (type %s); ALLOWED_USERS=%r",
-            event.sender_id, type(event.sender_id).__name__, config.ALLOWED_USERS,
-        )
-        await event.reply(
-            f"Not authorised. Your id is `{event.sender_id}` - "
-            "add it to ALLOWED_USERS and restart the bot."
-        )
+    if not is_trusted(event):
+        await reply_not_authorised(event)
         return
     await queue.put((event.chat_id, event.id, event.id))
     if queue.qsize() > 1:
@@ -237,9 +307,11 @@ async def on_file(event):
 
 
 async def main():
-    log.info("ALLOWED_USERS loaded as: %r", config.ALLOWED_USERS)
-    if not config.ALLOWED_USERS:
-        log.warning("ALLOWED_USERS is empty - every upload will be rejected.")
+    log.info(
+        "ALLOWED_USERS=%r ALLOWED_CHATS=%r", config.ALLOWED_USERS, config.ALLOWED_CHATS
+    )
+    if not config.ALLOWED_USERS and not config.ALLOWED_CHATS:
+        log.warning("ALLOWED_USERS and ALLOWED_CHATS are both empty - everything will be rejected.")
 
     drive.load_credentials()  # fail fast if Drive auth is not set up
     log.info("Drive credentials OK")

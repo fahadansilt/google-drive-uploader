@@ -22,15 +22,19 @@ TG_API_HASH = _req("TG_API_HASH")
 BOT_TOKEN = _req("BOT_TOKEN")
 USER_SESSION = os.getenv("USER_SESSION", "").strip()
 
-_allowed_raw = os.getenv("ALLOWED_USERS", "")
-try:
-    ALLOWED_USERS = {
-        int(uid) for uid in _allowed_raw.replace(" ", "").split(",") if uid
-    }
-except ValueError as exc:
-    raise SystemExit(
-        f"ALLOWED_USERS={_allowed_raw!r} contains a non-numeric value: {exc}"
-    ) from exc
+def _id_set(name):
+    raw = os.getenv(name, "")
+    try:
+        return {int(v) for v in raw.replace(" ", "").split(",") if v}
+    except ValueError as exc:
+        raise SystemExit(f"{name}={raw!r} contains a non-numeric value: {exc}") from exc
+
+
+ALLOWED_USERS = _id_set("ALLOWED_USERS")
+# Channels/groups trusted wholesale - needed because posts made as the channel
+# itself (or by an anonymous group admin) carry sender_id=None, so there is no
+# per-user id to check. Only add chats only you/trusted admins can post in.
+ALLOWED_CHATS = _id_set("ALLOWED_CHATS")
 
 GOOGLE_CLIENT_ID = _req("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = _req("GOOGLE_CLIENT_SECRET")
