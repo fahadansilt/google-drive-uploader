@@ -22,9 +22,15 @@ TG_API_HASH = _req("TG_API_HASH")
 BOT_TOKEN = _req("BOT_TOKEN")
 USER_SESSION = os.getenv("USER_SESSION", "").strip()
 
-ALLOWED_USERS = {
-    int(uid) for uid in os.getenv("ALLOWED_USERS", "").replace(" ", "").split(",") if uid
-}
+_allowed_raw = os.getenv("ALLOWED_USERS", "")
+try:
+    ALLOWED_USERS = {
+        int(uid) for uid in _allowed_raw.replace(" ", "").split(",") if uid
+    }
+except ValueError as exc:
+    raise SystemExit(
+        f"ALLOWED_USERS={_allowed_raw!r} contains a non-numeric value: {exc}"
+    ) from exc
 
 GOOGLE_CLIENT_ID = _req("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = _req("GOOGLE_CLIENT_SECRET")

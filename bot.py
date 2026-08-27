@@ -222,7 +222,14 @@ async def on_id(event):
 async def on_file(event):
     if event.sender_id not in config.ALLOWED_USERS:
         log.warning("rejected file from %s", event.sender_id)
-        await event.reply("Not authorised. Add your user id to ALLOWED_USERS.")
+        log.warning(
+            "rejected file from sender_id=%r (type %s); ALLOWED_USERS=%r",
+            event.sender_id, type(event.sender_id).__name__, config.ALLOWED_USERS,
+        )
+        await event.reply(
+            f"Not authorised. Your id is `{event.sender_id}` - "
+            "add it to ALLOWED_USERS and restart the bot."
+        )
         return
     await queue.put((event.chat_id, event.id, event.id))
     if queue.qsize() > 1:
@@ -230,6 +237,7 @@ async def on_file(event):
 
 
 async def main():
+    log.info("ALLOWED_USERS loaded as: %r", config.ALLOWED_USERS)
     if not config.ALLOWED_USERS:
         log.warning("ALLOWED_USERS is empty - every upload will be rejected.")
 

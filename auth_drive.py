@@ -4,6 +4,8 @@ Headless VPS? Either run this on your laptop and scp token.json across, or
 forward the port first:   ssh -L 8080:localhost:8080 user@vps
 then run this on the VPS and open the printed URL in your local browser.
 """
+import os
+
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 import config
@@ -23,7 +25,7 @@ CLIENT_CONFIG = {
 def main():
     flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, config.SCOPES)
     creds = flow.run_local_server(
-        port=8080,
+        port=int(os.getenv("AUTH_PORT", "8080")),
         access_type="offline",
         prompt="consent",  # forces a refresh_token even on re-auth
         open_browser=False,
