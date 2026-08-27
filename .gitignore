@@ -1,0 +1,9 @@
+.env
+token.json
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+downloads/
+venv/
+.idea

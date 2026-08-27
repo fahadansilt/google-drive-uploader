@@ -1,0 +1,28 @@
+[Unit]
+Description=Telegram to Google Drive bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=drivebot
+Group=drivebot
+WorkingDirectory=/opt/drive-bot
+ExecStart=/opt/drive-bot/venv/bin/python /opt/drive-bot/bot.py
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Unbuffered so journalctl shows progress lines as they happen
+Environment=PYTHONUNBUFFERED=1
+
+# Hardening: the bot only ever needs its own directory
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/drive-bot
+
+[Install]
+WantedBy=multi-user.target
