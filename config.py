@@ -45,6 +45,11 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "./downloads").strip()
 UPLOAD_CHUNK = _int("UPLOAD_CHUNK_MB", 16) * 1024 * 1024
 BOT_DOWNLOAD_LIMIT = _int("BOT_DOWNLOAD_LIMIT_MB", 2000) * 1024 * 1024
 
+# ---- Torrent / aria2 Configuration -----------------------------------------
+ARIA2_HOST = os.getenv("ARIA2_HOST", "http://127.0.0.1").strip()
+ARIA2_PORT = _int("ARIA2_PORT", 6800)
+ARIA2_SECRET = os.getenv("ARIA2_SECRET", "").strip()
+
 # Per-file access to what this app creates. If uploads into DRIVE_FOLDER_ID are
 # rejected, widen to "https://www.googleapis.com/auth/drive".
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]

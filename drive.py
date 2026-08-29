@@ -51,15 +51,20 @@ def build_service():
     return build("drive", "v3", credentials=load_credentials(), cache_discovery=False)
 
 
-def upload(path, name, mime_type=None, progress_cb=None):
+class TransferCancelled(Exception):
+    """Raised when a transfer is cancelled by user request."""
+
+
+def upload(path, name, mime_type=None, parent_id=None, progress_cb=None, cancel_event=None):
     """Upload `path` to Drive as `name`. Returns the created file's metadata.
 
     Runs blocking, so callers on the event loop should hand it to a thread.
     """
     service = build_service()
     body = {"name": name}
-    if config.DRIVE_FOLDER_ID:
-        body["parents"] = [config.DRIVE_FOLDER_ID]
+    target_parent = parent_id or config.DRIVE_FOLDER_ID
+    if target_parent:
+        body["parents"] = [target_parent]
 
     media = MediaFileUpload(
         path,
@@ -79,6 +84,9 @@ def upload(path, name, mime_type=None, progress_cb=None):
     attempt = 0
 
     while response is None:
+        if cancel_event and cancel_event.is_set():
+            raise TransferCancelled("Drive upload cancelled by user.")
+
         try:
             status, response = request.next_chunk(num_retries=3)
             attempt = 0
@@ -102,6 +110,95 @@ def upload(path, name, mime_type=None, progress_cb=None):
     if progress_cb:
         progress_cb(total, total)
     return response
+
+
+def create_folder(name, parent_id=None):
+    """Create a folder in Google Drive and return its metadata."""
+    service = build_service()
+    body = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+    }
+    target_parent = parent_id or config.DRIVE_FOLDER_ID
+    if target_parent:
+        body["parents"] = [target_parent]
+
+    folder = service.files().create(
+        body=body,
+        fields="id,name,webViewLink",
+        supportsAllDrives=True,
+    ).execute()
+    return folder
+
+
+def upload_folder(local_dir, folder_name=None, parent_folder_id=None, progress_cb=None, cancel_event=None):
+    """Recursively upload an entire directory to Google Drive.
+
+    Returns the created top-level folder's metadata.
+    """
+    local_dir = os.path.abspath(local_dir)
+    root_name = folder_name or os.path.basename(local_dir)
+
+    # 1. Compute total size across all files
+    all_files = []
+    total_bytes = 0
+    for root, _, filenames in os.walk(local_dir):
+        for fname in filenames:
+            fpath = os.path.join(root, fname)
+            fsize = os.path.getsize(fpath)
+            all_files.append((fpath, fsize))
+            total_bytes += fsize
+
+    # 2. Create root folder in Google Drive
+    if cancel_event and cancel_event.is_set():
+        raise TransferCancelled("Upload cancelled by user.")
+
+    root_folder = create_folder(root_name, parent_id=parent_folder_id)
+    root_folder_id = root_folder["id"]
+
+    # Cache drive folder IDs by relative directory path
+    folder_cache = {"": root_folder_id}
+
+    uploaded_so_far = 0
+
+    for fpath, fsize in all_files:
+        if cancel_event and cancel_event.is_set():
+            raise TransferCancelled("Upload cancelled by user.")
+
+        rel_path = os.path.relpath(fpath, local_dir)
+        rel_dir = os.path.dirname(rel_path)
+        file_name = os.path.basename(fpath)
+
+        # Ensure subfolder hierarchy exists in Drive
+        if rel_dir not in folder_cache:
+            current_parent = root_folder_id
+            parts = rel_dir.replace("\\", "/").split("/")
+            accumulated = ""
+            for part in parts:
+                accumulated = os.path.join(accumulated, part) if accumulated else part
+                if accumulated not in folder_cache:
+                    new_folder = create_folder(part, parent_id=current_parent)
+                    folder_cache[accumulated] = new_folder["id"]
+                current_parent = folder_cache[accumulated]
+
+        target_parent = folder_cache[rel_dir]
+
+        def file_progress(done_in_file, total_in_file):
+            if progress_cb:
+                progress_cb(uploaded_so_far + done_in_file, total_bytes)
+
+        upload(
+            fpath,
+            file_name,
+            parent_id=target_parent,
+            progress_cb=file_progress,
+            cancel_event=cancel_event,
+        )
+        uploaded_so_far += fsize
+        if progress_cb:
+            progress_cb(uploaded_so_far, total_bytes)
+
+    return root_folder
 
 
 def _list_folder(service, folder_id, trashed):

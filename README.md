@@ -116,6 +116,29 @@ sudo systemctl enable --now drive-bot
 journalctl -u drive-bot -f
 ```
 
+## Features & Usage
+
+### 1. Telegram File Uploads
+Send or forward any document / media to the bot:
+- **Up to 2 GB**: Send directly in a private DM with the bot.
+- **2 GB to 4 GB**: Post in a shared group/channel where both the bot and your configured user account sit.
+
+### 2. BitTorrent & Magnet Links (`aria2c`)
+- **Magnet link**: Send any magnet URI starting with `magnet:?xt=urn:...` or `/magnet <link>`.
+- **.torrent file**: Send or upload any `.torrent` file directly.
+- The bot resolves metadata, tracks live swarm metrics (**Seeders**, **Peers**, **Speed**, **ETA**), downloads the content, and uploads it to Google Drive.
+- **Single file torrent**: Uploaded directly to your Drive folder.
+- **Multi-file torrent** (e.g. TV seasons, music albums): The bot automatically creates a folder in Google Drive matching the torrent title, mirrors all files/subfolders, and shares the Google Drive folder link.
+
+> **Requirement**: Make sure `aria2c` is installed on your VPS:
+> ```bash
+> sudo apt update && sudo apt install -y aria2
+> ```
+
+### 3. Interactive Transfer Cancellation
+- Every active transfer message displays an inline **`[Cancel ❌]`** button.
+- Clicking the cancel button or sending `/cancel` immediately halts in-progress Telegram downloads, torrent swarms, or Google Drive uploads and wipes partial data from the temporary disk.
+
 ## Wiping the Drive folder
 
 `/wipe` permanently deletes every file in `DRIVE_FOLDER_ID`, plus anything
@@ -141,9 +164,10 @@ root. Gated by the same `ALLOWED_USERS` / `ALLOWED_CHATS` check as uploads.
 
 The whole file lands on disk before the upload starts, so you need
 **headroom ≥ the largest file** you intend to move — 4 GB files mean at least
-5 GB free in `DOWNLOAD_DIR`. `handle_job()` checks free space before
-downloading and refuses with a clear message rather than filling the disk. The
-temp file is removed in a `finally`, so it goes away on failure too.
+5 GB free in `DOWNLOAD_DIR`. `handle_tg_file_job()` and `torrent_manager` check
+free space before downloading and refuse with a clear message rather than
+filling the disk. Temp files and directories are safely cleaned up in all
+scenarios (success, failure, or cancellation).
 
 ## Configuration
 

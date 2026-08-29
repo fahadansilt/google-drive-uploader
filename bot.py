@@ -1,18 +1,23 @@
-"""Telegram -> Google Drive bridge (MTProto, handles files up to 4 GB)."""
+"""Telegram -> Google Drive bridge (MTProto, handles files up to 4 GB, Torrents/Magnets & Cancellation)."""
 import asyncio
 import logging
 import mimetypes
 import os
 import re
 import shutil
+import threading
 import time
+import uuid
+from typing import Dict, Optional
 
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.sessions import StringSession
 
 import config
 import drive
+from drive import TransferCancelled
+from torrent import Aria2NotInstalledError, torrent_manager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,6 +29,7 @@ log = logging.getLogger("bot")
 
 UNSAFE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 EDIT_EVERY = 4.0  # seconds between status-message edits
+MAGNET_REGEX = re.compile(r"(?i)^(?:/(?:magnet|mirror)\s+)?(magnet:\?xt=urn:[^\s]+)")
 
 bot = TelegramClient("bot", config.TG_API_ID, config.TG_API_HASH)
 user = (
@@ -35,6 +41,8 @@ queue = asyncio.Queue()
 
 
 def human(n):
+    if n is None:
+        return "0B"
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or unit == "TB":
             return f"{int(n)}B" if unit == "B" else f"{n:.1f}{unit}"
@@ -53,35 +61,96 @@ class Progress:
         self.stage = "starting"
         self.done = 0
         self.total = 0
+        self.speed = 0
+        self.seeds = None
+        self.peers = None
         self.started = time.monotonic()
 
-    def begin(self, stage, total):
-        self.stage, self.done, self.total = stage, 0, total
+    def begin(self, stage, total=0, speed=0, seeds=None, peers=None):
+        self.stage = stage
+        self.done = 0
+        self.total = total
+        self.speed = speed
+        self.seeds = seeds
+        self.peers = peers
         self.started = time.monotonic()
 
-    def update(self, done, total=None):
+    def update(self, done, total=None, speed=0, seeds=None, peers=None):
         self.done = done
-        if total:
+        if total is not None:
             self.total = total
+        if speed > 0:
+            self.speed = speed
+        if seeds is not None:
+            self.seeds = seeds
+        if peers is not None:
+            self.peers = peers
+
+    def update_torrent(self, d: dict):
+        self.stage = d.get("stage", "downloading (torrent)")
+        self.done = d.get("done", 0)
+        self.total = d.get("total", 0)
+        self.speed = d.get("speed", 0)
+        self.seeds = d.get("seeds")
+        self.peers = d.get("peers")
 
     def render(self, title):
         total, done = self.total, self.done
         pct = (done / total * 100) if total else 0
-        filled = int(pct // 5)
+        filled = min(max(int(pct // 5), 0), 20)
         elapsed = max(time.monotonic() - self.started, 0.001)
-        speed = done / elapsed
-        eta = (total - done) / speed if speed > 0 and total else 0
-        return (
-            f"**{title}**\n"
-            f"`{'#' * filled}{'.' * (20 - filled)}` {pct:5.1f}%\n"
-            f"{self.stage}: {human(done)} / {human(total)}\n"
-            f"{human(speed)}/s - ETA {int(eta // 60)}m{int(eta % 60):02d}s"
-        )
+        calc_speed = self.speed if self.speed > 0 else (done / elapsed)
+        eta = (total - done) / calc_speed if calc_speed > 0 and total else 0
+
+        lines = [
+            f"**{title}**",
+            f"`[{'#' * filled}{'.' * (20 - filled)}]` {pct:5.1f}%",
+        ]
+        if total > 0:
+            lines.append(f"{self.stage}: {human(done)} / {human(total)}")
+            lines.append(f"⚡ {human(calc_speed)}/s - ⏳ ETA {int(eta // 60)}m{int(eta % 60):02d}s")
+        else:
+            lines.append(f"{self.stage}: {human(done)}")
+            lines.append(f"⚡ {human(calc_speed)}/s")
+
+        if self.seeds is not None or self.peers is not None:
+            s = self.seeds if self.seeds is not None else 0
+            p = self.peers if self.peers is not None else 0
+            lines.append(f"🌱 Seeders: {s} | 👥 Peers: {p}")
+
+        return "\n".join(lines)
 
 
-async def ticker(status_msg, prog, title, stop):
+class ActiveJob:
+    """Represents an active in-flight transfer with cancellation support."""
+
+    def __init__(self, job_id: str, chat_id: int, reply_to: int, sender_id: int, title: str = "Transfer"):
+        self.job_id = job_id
+        self.chat_id = chat_id
+        self.reply_to = reply_to
+        self.sender_id = sender_id
+        self.title = title
+        self.cancel_event = asyncio.Event()
+        self.thread_cancel_event = threading.Event()
+        self.cancelled_by: Optional[int] = None
+        self.task: Optional[asyncio.Task] = None
+        self.clean_paths: list[str] = []
+
+    def cancel(self, cancelled_by: Optional[int] = None):
+        self.cancelled_by = cancelled_by
+        self.cancel_event.set()
+        self.thread_cancel_event.set()
+        if self.task and not self.task.done():
+            self.task.cancel()
+
+
+active_jobs: Dict[str, ActiveJob] = {}
+
+
+async def ticker(status_msg, prog, title, stop, job_id=None):
     """Edit the status message on an interval until `stop` is set."""
     last = ""
+    buttons = [Button.inline("Cancel ❌", data=f"cancel:{job_id}")] if job_id else None
     while not stop.is_set():
         try:
             await asyncio.wait_for(stop.wait(), timeout=EDIT_EVERY)
@@ -92,11 +161,11 @@ async def ticker(status_msg, prog, title, stop):
         if text == last:
             continue
         try:
-            await status_msg.edit(text)
+            await status_msg.edit(text, buttons=buttons)
             last = text
         except (MessageNotModifiedError, FloodWaitError):
             pass
-        except Exception as exc:  # a failed status edit must not kill the transfer
+        except Exception as exc:
             log.debug("status edit failed: %s", exc)
 
 
@@ -130,37 +199,53 @@ async def resolve_source(chat_id, msg_id, size):
     return msg, "user"
 
 
-async def handle_job(chat_id, msg_id, reply_to):
-    status = await bot.send_message(chat_id, "Queued...", reply_to=reply_to)
+async def handle_tg_file_job(job: ActiveJob, msg_id: int):
+    """Process a Telegram file upload job."""
+    buttons = [Button.inline("Cancel ❌", data=f"cancel:{job.job_id}")]
+    status = await bot.send_message(job.chat_id, "Queued...", reply_to=job.reply_to, buttons=buttons)
     path = None
     try:
-        probe = await bot.get_messages(chat_id, ids=msg_id)
+        probe = await bot.get_messages(job.chat_id, ids=msg_id)
         if probe is None or probe.file is None:
-            await status.edit("That message no longer has a file attached.")
+            await status.edit("That message no longer has a file attached.", buttons=None)
             return
 
         size = probe.file.size or 0
         name = safe_name(probe.file.name, f"telegram_{msg_id}{probe.file.ext or ''}")
+        job.title = name
         mime = probe.file.mime_type or mimetypes.guess_type(name)[0]
 
         free = shutil.disk_usage(config.DOWNLOAD_DIR).free
         if free < size * 1.05:
             await status.edit(
                 f"Not enough disk space: need ~{human(size * 1.05)}, "
-                f"{human(free)} free in {config.DOWNLOAD_DIR}."
+                f"{human(free)} free in {config.DOWNLOAD_DIR}.",
+                buttons=None,
             )
             return
 
-        message, via = await resolve_source(chat_id, msg_id, size)
+        message, via = await resolve_source(job.chat_id, msg_id, size)
         client = bot if via == "bot" else user
         path = os.path.join(config.DOWNLOAD_DIR, f"{msg_id}_{name}")
+        job.clean_paths.append(path)
 
         prog = Progress()
         stop = asyncio.Event()
-        tick = asyncio.create_task(ticker(status, prog, name, stop))
+        tick = asyncio.create_task(ticker(status, prog, name, stop, job.job_id))
         try:
             prog.begin(f"downloading (via {via})", size)
-            await client.download_media(message, file=path, progress_callback=prog.update)
+
+            def on_dl_progress(done, total):
+                if job.cancel_event.is_set():
+                    raise TransferCancelled("Download cancelled by user.")
+                prog.update(done, total)
+
+            # Download from Telegram
+            dl_task = asyncio.create_task(client.download_media(message, file=path, progress_callback=on_dl_progress))
+            await dl_task
+
+            if job.cancel_event.is_set():
+                raise TransferCancelled("Download cancelled by user.")
 
             prog.begin("uploading to Drive", os.path.getsize(path))
             loop = asyncio.get_running_loop()
@@ -168,49 +253,249 @@ async def handle_job(chat_id, msg_id, reply_to):
             def on_chunk(done, total):
                 loop.call_soon_threadsafe(prog.update, done, total)
 
-            meta = await asyncio.to_thread(drive.upload, path, name, mime, on_chunk)
+            meta = await asyncio.to_thread(
+                drive.upload,
+                path,
+                name,
+                mime,
+                None,
+                on_chunk,
+                job.thread_cancel_event,
+            )
         finally:
             stop.set()
             await tick
 
         link = meta.get("webViewLink") or f"https://drive.google.com/file/d/{meta['id']}/view"
         await status.edit(
-            f"**Uploaded**\n`{name}`\n{human(size)}\n\n{link}", link_preview=False
+            f"**Uploaded**\n`{name}`\n{human(size)}\n\n{link}",
+            buttons=None,
+            link_preview=False,
         )
         log.info("uploaded %s (%s) as %s", name, human(size), meta["id"])
 
+    except (TransferCancelled, asyncio.CancelledError):
+        log.info("Job %s was cancelled", job.job_id)
+        try:
+            await status.edit(f"❌ **Transfer Cancelled**\n`{job.title}`", buttons=None)
+        except Exception:
+            pass
     except Exception as exc:
         log.exception("job failed")
         try:
-            await status.edit(f"**Failed**\n`{type(exc).__name__}`\n{exc}")
+            await status.edit(f"**Failed**\n`{type(exc).__name__}`\n{exc}", buttons=None)
         except Exception:
             pass
     finally:
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-            except OSError as exc:
-                log.warning("could not remove %s: %s", path, exc)
+        for p in job.clean_paths:
+            if os.path.exists(p):
+                try:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+                except OSError as exc:
+                    log.warning("could not remove %s: %s", p, exc)
+
+
+async def handle_torrent_job(job: ActiveJob, source: str, is_torrent_file: bool = False):
+    """Process a BitTorrent / Magnet upload job."""
+    buttons = [Button.inline("Cancel ❌", data=f"cancel:{job.job_id}")]
+    status = await bot.send_message(job.chat_id, "Queued torrent download...", reply_to=job.reply_to, buttons=buttons)
+
+    prog = Progress()
+    stop = asyncio.Event()
+    tick = None
+    target_path = None
+    torrent_title = "Resolving magnet metadata..." if not is_torrent_file else os.path.basename(source)
+    job.title = torrent_title
+
+    if is_torrent_file:
+        job.clean_paths.append(source)
+
+    try:
+        prog.begin("connecting to swarm", 0)
+        tick = asyncio.create_task(ticker(status, prog, torrent_title, stop, job.job_id))
+
+        loop = asyncio.get_running_loop()
+
+        def on_torrent_progress(stats: dict):
+            if "name" in stats and stats["name"]:
+                job.title = stats["name"]
+            loop.call_soon_threadsafe(prog.update_torrent, stats)
+
+        # 1. Download via aria2c
+        result = await torrent_manager.download(
+            source,
+            config.DOWNLOAD_DIR,
+            progress_cb=on_torrent_progress,
+            cancel_event=job.cancel_event,
+        )
+
+        target_path = result["path"]
+        torrent_title = result["name"]
+        job.title = torrent_title
+        is_dir = result["is_dir"]
+        total_size = result["total_size"]
+        job.clean_paths.append(target_path)
+
+        # 2. Check disk and upload to Google Drive
+        prog.begin("uploading to Drive", total_size)
+
+        def on_drive_chunk(done, total):
+            loop.call_soon_threadsafe(prog.update, done, total)
+
+        if is_dir:
+            meta = await asyncio.to_thread(
+                drive.upload_folder,
+                target_path,
+                torrent_title,
+                None,
+                on_drive_chunk,
+                job.thread_cancel_event,
+            )
+            link = meta.get("webViewLink") or f"https://drive.google.com/drive/folders/{meta['id']}"
+            stop.set()
+            if tick:
+                await tick
+            await status.edit(
+                f"📁 **Uploaded Folder**\n`{torrent_title}`\n{human(total_size)}\n\n{link}",
+                buttons=None,
+                link_preview=False,
+            )
+        else:
+            mime = mimetypes.guess_type(target_path)[0]
+            meta = await asyncio.to_thread(
+                drive.upload,
+                target_path,
+                torrent_title,
+                mime,
+                None,
+                on_drive_chunk,
+                job.thread_cancel_event,
+            )
+            link = meta.get("webViewLink") or f"https://drive.google.com/file/d/{meta['id']}/view"
+            stop.set()
+            if tick:
+                await tick
+            await status.edit(
+                f"**Uploaded**\n`{torrent_title}`\n{human(total_size)}\n\n{link}",
+                buttons=None,
+                link_preview=False,
+            )
+
+        log.info("uploaded torrent %s (%s) as %s", torrent_title, human(total_size), meta["id"])
+
+    except (TransferCancelled, asyncio.CancelledError):
+        log.info("Torrent job %s was cancelled", job.job_id)
+        stop.set()
+        if tick:
+            await tick
+        try:
+            await status.edit(f"❌ **Torrent Cancelled**\n`{job.title}`", buttons=None)
+        except Exception:
+            pass
+    except Aria2NotInstalledError as exc:
+        log.error("aria2 not installed: %s", exc)
+        stop.set()
+        if tick:
+            await tick
+        await status.edit(f"⚠️ **Torrent Engine Missing**\n\n{exc}", buttons=None)
+    except Exception as exc:
+        log.exception("torrent job failed")
+        stop.set()
+        if tick:
+            await tick
+        try:
+            await status.edit(f"**Torrent Failed**\n`{type(exc).__name__}`\n{exc}", buttons=None)
+        except Exception:
+            pass
+    finally:
+        for p in job.clean_paths:
+            if os.path.exists(p):
+                try:
+                    if os.path.isdir(p):
+                        shutil.rmtree(p, ignore_errors=True)
+                    else:
+                        os.remove(p)
+                except OSError as exc:
+                    log.warning("could not remove %s: %s", p, exc)
 
 
 async def worker():
     """One transfer at a time - bounds disk, RAM and bandwidth."""
     while True:
-        job = await queue.get()
+        job_data = await queue.get()
+        job_type = job_data[0]
+        job_id = uuid.uuid4().hex[:8]
+        chat_id = job_data[1]
+        source = job_data[2]
+        reply_to = job_data[3]
+        sender_id = job_data[4]
+
+        job = ActiveJob(job_id, chat_id, reply_to, sender_id)
+        active_jobs[job_id] = job
+
         try:
-            await handle_job(*job)
+            if job_type == "tg_file":
+                job.task = asyncio.current_task()
+                await handle_tg_file_job(job, msg_id=source)
+            elif job_type == "torrent":
+                is_file = job_data[5] if len(job_data) > 5 else False
+                job.task = asyncio.current_task()
+                await handle_torrent_job(job, source=source, is_torrent_file=is_file)
         finally:
+            active_jobs.pop(job_id, None)
             queue.task_done()
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^cancel:(.+)"))
+async def on_cancel_callback(event):
+    job_id = event.data_match.group(1).decode("utf-8")
+    if not is_trusted(event):
+        await event.answer("Not authorised to cancel this transfer.", alert=True)
+        return
+
+    job = active_jobs.get(job_id)
+    if job:
+        job.cancel(cancelled_by=event.sender_id)
+        await event.answer("Cancelling transfer...")
+    else:
+        await event.answer("Job is no longer active or already finished.", alert=True)
+
+
+@bot.on(events.NewMessage(pattern=r"^/cancel$"))
+async def on_cancel_command(event):
+    if not is_trusted(event):
+        await reply_not_authorised(event)
+        return
+
+    # Check for active jobs in this chat first, then any active jobs
+    matching = [j for j in active_jobs.values() if j.chat_id == event.chat_id]
+    if not matching:
+        matching = list(active_jobs.values())
+
+    if not matching:
+        await event.reply("No active transfers running.")
+        return
+
+    for j in matching:
+        j.cancel(cancelled_by=event.sender_id)
+    await event.reply(f"Cancelled {len(matching)} active transfer(s).")
 
 
 @bot.on(events.NewMessage(pattern=r"^/(start|help)"))
 async def on_start(event):
     await event.reply(
-        "Send me a file and I'll put it in Google Drive.\n\n"
-        f"- up to {human(config.BOT_DOWNLOAD_LIMIT)}: send it here directly\n"
-        "- larger: post it in a group I share with the linked user account\n\n"
-        "/id - show your Telegram user id\n"
-        "/wipe - permanently delete everything in the Drive folder (and its trash)"
+        "👋 **Telegram & Torrent to Google Drive Bot**\n\n"
+        "**Send me:**\n"
+        f"• **File**: Directly up to {human(config.BOT_DOWNLOAD_LIMIT)} (or larger in shared groups)\n"
+        "• **Magnet link**: Send `magnet:?xt=urn:...` or `/magnet <link>`\n"
+        "• **.torrent file**: Upload any `.torrent` file\n\n"
+        "**Commands:**\n"
+        "/cancel - cancel in-progress transfer\n"
+        "/id - show your Telegram user id & chat id\n"
+        "/wipe - permanently delete files in the Drive folder (and its trash)"
     )
 
 
@@ -301,9 +586,38 @@ async def on_file(event):
     if not is_trusted(event):
         await reply_not_authorised(event)
         return
-    await queue.put((event.chat_id, event.id, event.id))
+
+    # Check if this is a .torrent file
+    file_name = event.file.name or ""
+    if file_name.lower().endswith(".torrent"):
+        # Save .torrent to downloads
+        torrent_tmp = os.path.join(config.DOWNLOAD_DIR, f"{event.id}_{safe_name(file_name, 'file.torrent')}")
+        await bot.download_media(event.message, file=torrent_tmp)
+        await queue.put(("torrent", event.chat_id, torrent_tmp, event.id, event.sender_id, True))
+        if queue.qsize() > 1:
+            await event.reply(f"Queued torrent file - {queue.qsize()} ahead of this one.")
+        else:
+            await event.reply("Queued torrent file...")
+        return
+
+    # Regular Telegram file
+    await queue.put(("tg_file", event.chat_id, event.id, event.id, event.sender_id))
     if queue.qsize() > 1:
         await event.reply(f"Queued - {queue.qsize()} ahead of this one.")
+
+
+@bot.on(events.NewMessage(pattern=MAGNET_REGEX))
+async def on_magnet(event):
+    if not is_trusted(event):
+        await reply_not_authorised(event)
+        return
+
+    magnet_uri = event.pattern_match.group(1).strip()
+    await queue.put(("torrent", event.chat_id, magnet_uri, event.id, event.sender_id, False))
+    if queue.qsize() > 1:
+        await event.reply(f"Queued torrent magnet - {queue.qsize()} ahead of this one.")
+    else:
+        await event.reply("Queued torrent magnet...")
 
 
 async def main():
@@ -330,8 +644,19 @@ async def main():
             human(config.BOT_DOWNLOAD_LIMIT),
         )
 
-    asyncio.create_task(worker())
-    await bot.run_until_disconnected()
+    # Pre-check aria2c availability
+    if shutil.which("aria2c"):
+        log.info("aria2c found in PATH - torrent engine ready")
+    else:
+        log.warning("aria2c NOT found in PATH. Install via `sudo apt install aria2` for torrent support.")
+
+    worker_task = asyncio.create_task(worker())
+
+    try:
+        await bot.run_until_disconnected()
+    finally:
+        worker_task.cancel()
+        await torrent_manager.close()
 
 
 if __name__ == "__main__":
