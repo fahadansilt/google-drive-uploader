@@ -135,7 +135,12 @@ Send or forward any document / media to the bot:
 > sudo apt update && sudo apt install -y aria2
 > ```
 
-### 3. Interactive Transfer Cancellation
+### 3. Storage & Downloaded Files (`/files`)
+- View available VPS disk space, used space percentage bar, and total downloads folder size.
+- Lists all active/stored files and folders in the downloads directory with their sizes.
+- Aliases: `/files`, `/storage`, `/disk`, `/ls`.
+
+### 4. Interactive Transfer Cancellation
 - Every active transfer message displays an inline **`[Cancel ❌]`** button.
 - Clicking the cancel button or sending `/cancel` immediately halts in-progress Telegram downloads, torrent swarms, or Google Drive uploads and wipes partial data from the temporary disk.
 

@@ -527,6 +527,97 @@ async def on_cancel_command(event):
     await event.reply(f"Cancelled {len(matching)} transfer(s).")
 
 
+def get_dir_size(path: str) -> int:
+    """Calculate total size of directory in bytes."""
+    total = 0
+    for root, _, files in os.walk(path):
+        for f in files:
+            fp = os.path.join(root, f)
+            if not os.path.islink(fp) and os.path.exists(fp):
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
+    return total
+
+
+def list_download_items(path: str) -> list[dict]:
+    """List all top-level files and folders inside download directory."""
+    if not os.path.exists(path):
+        return []
+    items = []
+    try:
+        entries = list(os.scandir(path))
+    except Exception:
+        return []
+
+    for entry in sorted(entries, key=lambda e: e.stat().st_mtime if os.path.exists(e.path) else 0, reverse=True):
+        if entry.name.startswith("."):
+            continue
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                size = get_dir_size(entry.path)
+                items.append({"name": entry.name, "is_dir": True, "size": size})
+            elif entry.is_file(follow_symlinks=False):
+                size = entry.stat().st_size
+                items.append({"name": entry.name, "is_dir": False, "size": size})
+        except OSError:
+            pass
+    return items
+
+
+@bot.on(events.NewMessage(pattern=r"^/(?:files|storage|disk|ls)$"))
+async def on_files_command(event):
+    if not is_trusted(event):
+        await reply_not_authorised(event)
+        return
+
+    # Check disk usage
+    try:
+        usage = shutil.disk_usage(config.DOWNLOAD_DIR)
+        total_disk = usage.total
+        free_disk = usage.free
+        used_disk = usage.used
+        free_pct = (free_disk / total_disk * 100) if total_disk else 0
+        used_pct = (used_disk / total_disk * 100) if total_disk else 0
+    except Exception as exc:
+        await event.reply(f"Could not read disk usage: {exc}")
+        return
+
+    items = list_download_items(config.DOWNLOAD_DIR)
+    dir_size = sum(item["size"] for item in items)
+
+    filled_bar = min(max(int(used_pct // 5), 0), 20)
+    bar = f"`[{'#' * filled_bar}{'.' * (20 - filled_bar)}]` {used_pct:.1f}% used"
+
+    lines = [
+        "💾 **Storage & Downloads Overview**",
+        f"**Path**: `{config.DOWNLOAD_DIR}`",
+        "",
+        f"📊 **Disk Usage**:\n{bar}",
+        f"• **Free Space**: `{human(free_disk)}` ({free_pct:.1f}% free)",
+        f"• **Used Space**: `{human(used_disk)}`",
+        f"• **Total Disk**: `{human(total_disk)}`",
+        f"• **Downloads Folder Size**: `{human(dir_size)}` ({len(items)} items)",
+        "",
+    ]
+
+    if not items:
+        lines.append("📂 **Downloaded Files**: _No files currently in downloads folder._")
+    else:
+        lines.append(f"📂 **Downloaded Files** ({len(items)}):")
+        for i, item in enumerate(items[:25], 1):
+            icon = "📁" if item["is_dir"] else "📄"
+            name = item["name"]
+            if len(name) > 38:
+                name = name[:35] + "..."
+            lines.append(f"{i}. {icon} `{name}` ({human(item['size'])})")
+        if len(items) > 25:
+            lines.append(f"_...and {len(items) - 25} more items_")
+
+    await event.reply("\n".join(lines))
+
+
 @bot.on(events.NewMessage(pattern=r"^/(start|help)"))
 async def on_start(event):
     await event.reply(
@@ -536,6 +627,7 @@ async def on_start(event):
         "• **Magnet link**: Send `magnet:?xt=urn:...` or `/magnet <link>`\n"
         "• **.torrent file**: Upload any `.torrent` file\n\n"
         "**Commands:**\n"
+        "/files - list downloaded files & available disk space\n"
         "/cancel - cancel in-progress transfer\n"
         "/id - show your Telegram user id & chat id\n"
         "/wipe - permanently delete files in the Drive folder (and its trash)"
