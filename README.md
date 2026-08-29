@@ -136,34 +136,27 @@ Send or forward any document / media to the bot:
 > ```
 
 ### 3. Storage & Downloaded Files (`/files`)
-- View available VPS disk space, used space percentage bar, and total downloads folder size.
-- Lists all active/stored files and folders in the downloads directory with their sizes.
-- Aliases: `/files`, `/storage`, `/disk`, `/ls`.
+- **Google Drive Storage**: Displays total quota, used space (in Drive and Trash), free space, and usage percentage bar.
+- **VPS Local Disk**: Displays available disk space, used space percentage bar, and downloads folder size.
+- **Files on Disk**: Lists all active/stored files and folders in the downloads directory with their sizes.
+- Aliases: `/files`, `/storage`, `/driveinfo`, `/disk`, `/ls`.
 
 ### 4. Interactive Transfer Cancellation
 - Every active transfer message displays an inline **`[Cancel ❌]`** button.
 - Clicking the cancel button or sending `/cancel` immediately halts in-progress Telegram downloads, torrent swarms, or Google Drive uploads and wipes partial data from the temporary disk.
 
-## Wiping the Drive folder
+## Wiping Drive folder & Local Downloads
 
-`/wipe` permanently deletes every file in `DRIVE_FOLDER_ID`, plus anything
-already sitting in the trash that originated from that folder. It calls
-`files.delete()` per file, which skips the trash entirely — this is not a
-"move to bin" that you could later recover from Drive's trash UI.
+`/wipe` permanently deletes every file in `DRIVE_FOLDER_ID` (including files in the trash that originated from that folder) **and** purges all files/folders inside the local VPS `DOWNLOAD_DIR`.
 
-Scope is deliberately narrow: it only ever queries `'{DRIVE_FOLDER_ID}' in
-parents`, never a whole-account trash purge (`files.emptyTrash`), so files
-elsewhere in your Drive are never touched even in the trashed state — that
-also means it works within the existing `drive.file` OAuth scope, no
-re-consent needed.
+Scope for Drive is deliberately narrow: it only ever queries `'{DRIVE_FOLDER_ID}' in parents`, never a whole-account trash purge (`files.emptyTrash`), so files elsewhere in your Drive are never touched even in the trashed state — that also means it works within the existing `drive.file` OAuth scope, no re-consent needed.
 
 Two-step by design:
 ```
-/wipe            -> counts targets, warns, does nothing yet
-/wipe confirm    -> actually deletes
+/wipe            -> counts Drive and local targets, warns, does nothing yet
+/wipe confirm    -> permanently deletes from Drive and purges local downloads
 ```
-Refuses outright if `DRIVE_FOLDER_ID` is unset, rather than touching My Drive
-root. Gated by the same `ALLOWED_USERS` / `ALLOWED_CHATS` check as uploads.
+Refuses outright if `DRIVE_FOLDER_ID` is unset, rather than touching My Drive root. Gated by the same `ALLOWED_USERS` / `ALLOWED_CHATS` check as uploads.
 
 ## Disk
 

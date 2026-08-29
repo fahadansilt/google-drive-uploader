@@ -566,13 +566,50 @@ def list_download_items(path: str) -> list[dict]:
     return items
 
 
-@bot.on(events.NewMessage(pattern=r"^/(?:files|storage|disk|ls)$"))
+def purge_download_dir(path: str) -> tuple[int, int]:
+    """Delete all items inside downloads directory and return (count, bytes_freed)."""
+    if not os.path.exists(path):
+        return 0, 0
+    deleted_count = 0
+    bytes_freed = 0
+    try:
+        entries = list(os.scandir(path))
+    except Exception:
+        return 0, 0
+
+    for entry in entries:
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                size = get_dir_size(entry.path)
+                shutil.rmtree(entry.path, ignore_errors=True)
+                deleted_count += 1
+                bytes_freed += size
+            else:
+                size = entry.stat().st_size
+                os.remove(entry.path)
+                deleted_count += 1
+                bytes_freed += size
+        except OSError as exc:
+            log.warning("could not delete %s: %s", entry.path, exc)
+    return deleted_count, bytes_freed
+
+
+@bot.on(events.NewMessage(pattern=r"^/(?:files|storage|driveinfo|disk|ls)$"))
 async def on_files_command(event):
     if not is_trusted(event):
         await reply_not_authorised(event)
         return
 
-    # Check disk usage
+    status_msg = await event.reply("Fetching storage info...")
+
+    # 1. Fetch Google Drive Quota
+    drive_info = None
+    try:
+        drive_info = await asyncio.to_thread(drive.get_storage_quota)
+    except Exception as exc:
+        log.warning("Could not fetch Google Drive quota: %s", exc)
+
+    # 2. Fetch VPS Disk Usage
     try:
         usage = shutil.disk_usage(config.DOWNLOAD_DIR)
         total_disk = usage.total
@@ -581,41 +618,60 @@ async def on_files_command(event):
         free_pct = (free_disk / total_disk * 100) if total_disk else 0
         used_pct = (used_disk / total_disk * 100) if total_disk else 0
     except Exception as exc:
-        await event.reply(f"Could not read disk usage: {exc}")
+        await status_msg.edit(f"Could not read disk usage: {exc}")
         return
 
+    # 3. List Local Download Items
     items = list_download_items(config.DOWNLOAD_DIR)
     dir_size = sum(item["size"] for item in items)
 
-    filled_bar = min(max(int(used_pct // 5), 0), 20)
-    bar = f"`[{'#' * filled_bar}{'.' * (20 - filled_bar)}]` {used_pct:.1f}% used"
+    vps_bar_filled = min(max(int(used_pct // 5), 0), 20)
+    vps_bar = f"`[{'#' * vps_bar_filled}{'.' * (20 - vps_bar_filled)}]` {used_pct:.1f}% used"
 
-    lines = [
-        "💾 **Storage & Downloads Overview**",
-        f"**Path**: `{config.DOWNLOAD_DIR}`",
-        "",
-        f"📊 **Disk Usage**:\n{bar}",
-        f"• **Free Space**: `{human(free_disk)}` ({free_pct:.1f}% free)",
-        f"• **Used Space**: `{human(used_disk)}`",
-        f"• **Total Disk**: `{human(total_disk)}`",
-        f"• **Downloads Folder Size**: `{human(dir_size)}` ({len(items)} items)",
-        "",
-    ]
+    lines = ["💾 **Storage Overview**\n"]
 
+    # Render Google Drive Section
+    if drive_info:
+        email_tag = f" ({drive_info['user_email']})" if drive_info.get("user_email") else ""
+        lines.append(f"🌐 **Google Drive Storage**{email_tag}:")
+        if drive_info["limit"] > 0:
+            d_pct = drive_info["usage_pct"]
+            d_bar_filled = min(max(int(d_pct // 5), 0), 20)
+            d_bar = f"`[{'#' * d_bar_filled}{'.' * (20 - d_bar_filled)}]` {d_pct:.1f}% used"
+            d_free_pct = (drive_info["free"] / drive_info["limit"] * 100) if drive_info["limit"] else 0
+            lines.append(d_bar)
+            lines.append(f"• **Free Space**: `{human(drive_info['free'])}` ({d_free_pct:.1f}% free)")
+            lines.append(f"• **Used Space**: `{human(drive_info['usage'])}` (Drive: `{human(drive_info['usage_in_drive'])}`, Trash: `{human(drive_info['usage_in_trash'])}`)")
+            lines.append(f"• **Total Quota**: `{human(drive_info['limit'])}`")
+        else:
+            lines.append(f"• **Used Space**: `{human(drive_info['usage'])}` (Drive: `{human(drive_info['usage_in_drive'])}`, Trash: `{human(drive_info['usage_in_trash'])}`)")
+            lines.append("• **Total Quota**: Unlimited")
+        lines.append("")
+
+    # Render VPS Local Disk Section
+    lines.append("🖥️ **VPS Local Disk**:")
+    lines.append(vps_bar)
+    lines.append(f"• **Free Space**: `{human(free_disk)}` ({free_pct:.1f}% free)")
+    lines.append(f"• **Used Space**: `{human(used_disk)}`")
+    lines.append(f"• **Total Disk**: `{human(total_disk)}`")
+    lines.append(f"• **Downloads Folder**: `{human(dir_size)}` ({len(items)} item(s) in `{config.DOWNLOAD_DIR}`)")
+    lines.append("")
+
+    # Render Downloaded Files List
     if not items:
-        lines.append("📂 **Downloaded Files**: _No files currently in downloads folder._")
+        lines.append("📂 **Files in Downloads**: _Folder is currently empty._")
     else:
-        lines.append(f"📂 **Downloaded Files** ({len(items)}):")
-        for i, item in enumerate(items[:25], 1):
+        lines.append(f"📂 **Files in Downloads** ({len(items)}):")
+        for i, item in enumerate(items[:20], 1):
             icon = "📁" if item["is_dir"] else "📄"
             name = item["name"]
             if len(name) > 38:
                 name = name[:35] + "..."
             lines.append(f"{i}. {icon} `{name}` ({human(item['size'])})")
-        if len(items) > 25:
-            lines.append(f"_...and {len(items) - 25} more items_")
+        if len(items) > 20:
+            lines.append(f"_...and {len(items) - 20} more items_")
 
-    await event.reply("\n".join(lines))
+    await status_msg.edit("\n".join(lines))
 
 
 @bot.on(events.NewMessage(pattern=r"^/(start|help)"))
@@ -627,10 +683,10 @@ async def on_start(event):
         "• **Magnet link**: Send `magnet:?xt=urn:...` or `/magnet <link>`\n"
         "• **.torrent file**: Upload any `.torrent` file\n\n"
         "**Commands:**\n"
-        "/files - list downloaded files & available disk space\n"
+        "/files - show Google Drive & VPS storage + downloaded files\n"
         "/cancel - cancel in-progress transfer\n"
         "/id - show your Telegram user id & chat id\n"
-        "/wipe - permanently delete files in the Drive folder (and its trash)"
+        "/wipe - permanently delete files in Drive folder + clean downloads"
     )
 
 
@@ -667,24 +723,31 @@ async def on_wipe(event):
 
     confirmed = (event.pattern_match.group(1) or "").lower() == "confirm"
     if not confirmed:
-        status = await event.reply("Checking folder...")
+        status = await event.reply("Checking Drive & local downloads folder...")
         try:
             count = await asyncio.to_thread(drive.count_wipe_targets, config.DRIVE_FOLDER_ID)
         except Exception as exc:
             log.exception("wipe count failed")
-            await status.edit(f"Could not check the folder: {exc}")
+            await status.edit(f"Could not check the Drive folder: {exc}")
             return
-        if count == 0:
-            await status.edit("Folder (and its trash) is already empty. Nothing to do.")
+
+        local_items = list_download_items(config.DOWNLOAD_DIR)
+        local_size = sum(x["size"] for x in local_items)
+
+        if count == 0 and len(local_items) == 0:
+            await status.edit("Both Google Drive folder and local downloads are already empty. Nothing to do.")
             return
+
         await status.edit(
-            f"This will **permanently** delete {count} file(s) from the Drive "
-            "folder, including anything already trashed from it. This cannot "
-            "be undone.\n\nSend `/wipe confirm` to proceed."
+            f"⚠️ **Wipe Confirmation**\n\n"
+            f"This will **permanently** delete:\n"
+            f"• **Google Drive**: `{count}` file(s) in Drive folder (including its trash)\n"
+            f"• **Local Downloads**: `{len(local_items)}` item(s) (`{human(local_size)}`) in `{config.DOWNLOAD_DIR}`\n\n"
+            "This cannot be undone.\n\nSend `/wipe confirm` to proceed."
         )
         return
 
-    status = await event.reply("Wiping folder...")
+    status = await event.reply("Wiping Google Drive folder and purging local downloads...")
     prog = Progress()
     stop = asyncio.Event()
     tick = asyncio.create_task(ticker(status, prog, "Wiping Drive folder", stop))
@@ -706,13 +769,20 @@ async def on_wipe(event):
         stop.set()
         await tick
 
-    lines = [f"Deleted {result['deleted']}/{result['total']} file(s)."]
+    # Also purge local downloads directory
+    local_deleted, local_freed = purge_download_dir(config.DOWNLOAD_DIR)
+
+    lines = [
+        "🧹 **Wipe Complete**",
+        f"• **Google Drive**: Deleted {result['deleted']}/{result['total']} file(s).",
+        f"• **Local VPS**: Purged {local_deleted} download item(s) ({human(local_freed)} freed).",
+    ]
     if result["errors"]:
         log.warning("wipe errors: %s", result["errors"])
-        lines.append(f"{len(result['errors'])} failed:")
-        lines.extend(f"- {e}" for e in result["errors"][:10])
-        if len(result["errors"]) > 10:
-            lines.append(f"...and {len(result['errors']) - 10} more (see logs).")
+        lines.append(f"\n⚠️ {len(result['errors'])} Drive deletion error(s):")
+        lines.extend(f"- {e}" for e in result["errors"][:5])
+        if len(result["errors"]) > 5:
+            lines.append(f"...and {len(result['errors']) - 5} more (see logs).")
     await status.edit("\n".join(lines))
 
 

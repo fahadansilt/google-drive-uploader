@@ -253,3 +253,30 @@ def wipe_folder(folder_id, progress_cb=None):
             progress_cb(i, len(targets))
 
     return {"total": len(targets), "deleted": deleted, "errors": errors}
+
+
+def get_storage_quota():
+    """Retrieve Google Drive account and storage quota metrics."""
+    service = build_service()
+    about = service.about().get(fields="storageQuota,user(displayName,emailAddress)").execute()
+    quota = about.get("storageQuota", {})
+    user_info = about.get("user", {})
+
+    limit = int(quota.get("limit", 0))
+    usage = int(quota.get("usage", 0))
+    usage_in_drive = int(quota.get("usageInDrive", 0))
+    usage_in_trash = int(quota.get("usageInDriveTrash", 0))
+
+    free = max(limit - usage, 0) if limit > 0 else None
+    pct = (usage / limit * 100) if limit > 0 else 0
+
+    return {
+        "user_name": user_info.get("displayName", ""),
+        "user_email": user_info.get("emailAddress", ""),
+        "limit": limit,
+        "usage": usage,
+        "usage_in_drive": usage_in_drive,
+        "usage_in_trash": usage_in_trash,
+        "free": free,
+        "usage_pct": pct,
+    }
