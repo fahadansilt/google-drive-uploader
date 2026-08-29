@@ -8,7 +8,7 @@ import shutil
 import threading
 import time
 import uuid
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
@@ -122,13 +122,28 @@ class Progress:
 
 
 class ActiveJob:
-    """Represents an active in-flight transfer with cancellation support."""
+    """Represents a queued or in-flight transfer with cancellation support."""
 
-    def __init__(self, job_id: str, chat_id: int, reply_to: int, sender_id: int, title: str = "Transfer"):
+    def __init__(
+        self,
+        job_id: str,
+        job_type: str,
+        chat_id: int,
+        source: Any,
+        reply_to: int,
+        sender_id: int,
+        is_file: bool = False,
+        status_msg: Any = None,
+        title: str = "Transfer",
+    ):
         self.job_id = job_id
+        self.job_type = job_type  # "tg_file" or "torrent"
         self.chat_id = chat_id
+        self.source = source
         self.reply_to = reply_to
         self.sender_id = sender_id
+        self.is_file = is_file
+        self.status_msg = status_msg
         self.title = title
         self.cancel_event = asyncio.Event()
         self.thread_cancel_event = threading.Event()
@@ -199,11 +214,16 @@ async def resolve_source(chat_id, msg_id, size):
     return msg, "user"
 
 
-async def handle_tg_file_job(job: ActiveJob, msg_id: int):
-    """Process a Telegram file upload job."""
+async def handle_tg_file_job(job: ActiveJob):
+    """Process a Telegram file upload job by editing its existing status message."""
     buttons = [Button.inline("Cancel ❌", data=f"cancel:{job.job_id}")]
-    status = await bot.send_message(job.chat_id, "Queued...", reply_to=job.reply_to, buttons=buttons)
+    status = job.status_msg
+    if not status:
+        status = await bot.send_message(job.chat_id, "Starting download...", reply_to=job.reply_to, buttons=buttons)
+        job.status_msg = status
+
     path = None
+    msg_id = job.source
     try:
         probe = await bot.get_messages(job.chat_id, ids=msg_id)
         if probe is None or probe.file is None:
@@ -231,10 +251,10 @@ async def handle_tg_file_job(job: ActiveJob, msg_id: int):
 
         prog = Progress()
         stop = asyncio.Event()
+        prog.begin(f"downloading (via {via})", size)
+        await status.edit(prog.render(name), buttons=buttons)
         tick = asyncio.create_task(ticker(status, prog, name, stop, job.job_id))
         try:
-            prog.begin(f"downloading (via {via})", size)
-
             def on_dl_progress(done, total):
                 if job.cancel_event.is_set():
                     raise TransferCancelled("Download cancelled by user.")
@@ -298,11 +318,16 @@ async def handle_tg_file_job(job: ActiveJob, msg_id: int):
                     log.warning("could not remove %s: %s", p, exc)
 
 
-async def handle_torrent_job(job: ActiveJob, source: str, is_torrent_file: bool = False):
-    """Process a BitTorrent / Magnet upload job."""
+async def handle_torrent_job(job: ActiveJob):
+    """Process a BitTorrent / Magnet upload job by editing its existing status message."""
     buttons = [Button.inline("Cancel ❌", data=f"cancel:{job.job_id}")]
-    status = await bot.send_message(job.chat_id, "Queued torrent download...", reply_to=job.reply_to, buttons=buttons)
+    status = job.status_msg
+    if not status:
+        status = await bot.send_message(job.chat_id, "Starting torrent download...", reply_to=job.reply_to, buttons=buttons)
+        job.status_msg = status
 
+    source = job.source
+    is_torrent_file = job.is_file
     prog = Progress()
     stop = asyncio.Event()
     tick = None
@@ -315,6 +340,8 @@ async def handle_torrent_job(job: ActiveJob, source: str, is_torrent_file: bool 
 
     try:
         prog.begin("connecting to swarm", 0)
+        # Edit the queued message to show connecting/downloading status
+        await status.edit("Connecting to swarm / Resolving metadata...", buttons=buttons)
         tick = asyncio.create_task(ticker(status, prog, torrent_title, stop, job.job_id))
 
         loop = asyncio.get_running_loop()
@@ -339,7 +366,7 @@ async def handle_torrent_job(job: ActiveJob, source: str, is_torrent_file: bool 
         total_size = result["total_size"]
         job.clean_paths.append(target_path)
 
-        # 2. Check disk and upload to Google Drive
+        # 2. Upload to Google Drive
         prog.begin("uploading to Drive", total_size)
 
         def on_drive_chunk(done, total):
@@ -425,27 +452,32 @@ async def handle_torrent_job(job: ActiveJob, source: str, is_torrent_file: bool 
 async def worker():
     """One transfer at a time - bounds disk, RAM and bandwidth."""
     while True:
-        job_data = await queue.get()
-        job_type = job_data[0]
-        job_id = uuid.uuid4().hex[:8]
-        chat_id = job_data[1]
-        source = job_data[2]
-        reply_to = job_data[3]
-        sender_id = job_data[4]
-
-        job = ActiveJob(job_id, chat_id, reply_to, sender_id)
-        active_jobs[job_id] = job
-
+        job: ActiveJob = await queue.get()
         try:
-            if job_type == "tg_file":
-                job.task = asyncio.current_task()
-                await handle_tg_file_job(job, msg_id=source)
-            elif job_type == "torrent":
-                is_file = job_data[5] if len(job_data) > 5 else False
-                job.task = asyncio.current_task()
-                await handle_torrent_job(job, source=source, is_torrent_file=is_file)
+            if job.cancel_event.is_set():
+                if job.status_msg:
+                    try:
+                        await job.status_msg.edit(f"❌ **Cancelled (from queue)**\n`{job.title}`", buttons=None)
+                    except Exception:
+                        pass
+                for p in job.clean_paths:
+                    if os.path.exists(p):
+                        try:
+                            if os.path.isdir(p):
+                                shutil.rmtree(p, ignore_errors=True)
+                            else:
+                                os.remove(p)
+                        except OSError:
+                            pass
+                continue
+
+            job.task = asyncio.current_task()
+            if job.job_type == "tg_file":
+                await handle_tg_file_job(job)
+            elif job.job_type == "torrent":
+                await handle_torrent_job(job)
         finally:
-            active_jobs.pop(job_id, None)
+            active_jobs.pop(job.job_id, None)
             queue.task_done()
 
 
@@ -460,6 +492,12 @@ async def on_cancel_callback(event):
     if job:
         job.cancel(cancelled_by=event.sender_id)
         await event.answer("Cancelling transfer...")
+        # If job is still in queue, immediately edit its message
+        if job.status_msg and job.task is None:
+            try:
+                await job.status_msg.edit(f"❌ **Cancelled (from queue)**\n`{job.title}`", buttons=None)
+            except Exception:
+                pass
     else:
         await event.answer("Job is no longer active or already finished.", alert=True)
 
@@ -470,7 +508,6 @@ async def on_cancel_command(event):
         await reply_not_authorised(event)
         return
 
-    # Check for active jobs in this chat first, then any active jobs
     matching = [j for j in active_jobs.values() if j.chat_id == event.chat_id]
     if not matching:
         matching = list(active_jobs.values())
@@ -481,7 +518,13 @@ async def on_cancel_command(event):
 
     for j in matching:
         j.cancel(cancelled_by=event.sender_id)
-    await event.reply(f"Cancelled {len(matching)} active transfer(s).")
+        if j.status_msg and j.task is None:
+            try:
+                await j.status_msg.edit(f"❌ **Cancelled (from queue)**\n`{j.title}`", buttons=None)
+            except Exception:
+                pass
+
+    await event.reply(f"Cancelled {len(matching)} transfer(s).")
 
 
 @bot.on(events.NewMessage(pattern=r"^/(start|help)"))
@@ -587,23 +630,50 @@ async def on_file(event):
         await reply_not_authorised(event)
         return
 
-    # Check if this is a .torrent file
+    job_id = uuid.uuid4().hex[:8]
+    buttons = [Button.inline("Cancel ❌", data=f"cancel:{job_id}")]
     file_name = event.file.name or ""
+    q_len = queue.qsize()
+
+    # Check if this is a .torrent file
     if file_name.lower().endswith(".torrent"):
-        # Save .torrent to downloads
         torrent_tmp = os.path.join(config.DOWNLOAD_DIR, f"{event.id}_{safe_name(file_name, 'file.torrent')}")
         await bot.download_media(event.message, file=torrent_tmp)
-        await queue.put(("torrent", event.chat_id, torrent_tmp, event.id, event.sender_id, True))
-        if queue.qsize() > 1:
-            await event.reply(f"Queued torrent file - {queue.qsize()} ahead of this one.")
-        else:
-            await event.reply("Queued torrent file...")
+        msg_text = f"Queued torrent file ({q_len} ahead in queue)..." if q_len > 0 else "Queued torrent file..."
+        status_msg = await event.reply(msg_text, buttons=buttons)
+
+        job = ActiveJob(
+            job_id=job_id,
+            job_type="torrent",
+            chat_id=event.chat_id,
+            source=torrent_tmp,
+            reply_to=event.id,
+            sender_id=event.sender_id,
+            is_file=True,
+            status_msg=status_msg,
+            title=file_name,
+        )
+        active_jobs[job_id] = job
+        await queue.put(job)
         return
 
     # Regular Telegram file
-    await queue.put(("tg_file", event.chat_id, event.id, event.id, event.sender_id))
-    if queue.qsize() > 1:
-        await event.reply(f"Queued - {queue.qsize()} ahead of this one.")
+    msg_text = f"Queued ({q_len} ahead in queue)..." if q_len > 0 else "Queued..."
+    status_msg = await event.reply(msg_text, buttons=buttons)
+
+    job = ActiveJob(
+        job_id=job_id,
+        job_type="tg_file",
+        chat_id=event.chat_id,
+        source=event.id,
+        reply_to=event.id,
+        sender_id=event.sender_id,
+        is_file=False,
+        status_msg=status_msg,
+        title=file_name or f"telegram_{event.id}",
+    )
+    active_jobs[job_id] = job
+    await queue.put(job)
 
 
 @bot.on(events.NewMessage(pattern=MAGNET_REGEX))
@@ -613,11 +683,26 @@ async def on_magnet(event):
         return
 
     magnet_uri = event.pattern_match.group(1).strip()
-    await queue.put(("torrent", event.chat_id, magnet_uri, event.id, event.sender_id, False))
-    if queue.qsize() > 1:
-        await event.reply(f"Queued torrent magnet - {queue.qsize()} ahead of this one.")
-    else:
-        await event.reply("Queued torrent magnet...")
+    job_id = uuid.uuid4().hex[:8]
+    buttons = [Button.inline("Cancel ❌", data=f"cancel:{job_id}")]
+    q_len = queue.qsize()
+
+    msg_text = f"Queued torrent magnet ({q_len} ahead in queue)..." if q_len > 0 else "Queued torrent magnet..."
+    status_msg = await event.reply(msg_text, buttons=buttons)
+
+    job = ActiveJob(
+        job_id=job_id,
+        job_type="torrent",
+        chat_id=event.chat_id,
+        source=magnet_uri,
+        reply_to=event.id,
+        sender_id=event.sender_id,
+        is_file=False,
+        status_msg=status_msg,
+        title="Magnet Torrent",
+    )
+    active_jobs[job_id] = job
+    await queue.put(job)
 
 
 async def main():
