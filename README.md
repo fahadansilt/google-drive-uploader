@@ -126,9 +126,14 @@ Send or forward any document / media to the bot:
 ### 2. BitTorrent & Magnet Links (`aria2c`)
 - **Magnet link**: Send any magnet URI starting with `magnet:?xt=urn:...` or `/magnet <link>`.
 - **.torrent file**: Send or upload any `.torrent` file directly.
-- The bot resolves metadata, tracks live swarm metrics (**Seeders**, **Peers**, **Speed**, **ETA**), downloads the content, and uploads it to Google Drive.
+- **Interactive Multi-File Selection**: For torrents with multiple files (e.g. TV seasons, album packs), the bot pauses after resolving metadata and presents an interactive Telegram menu with inline buttons:
+  - **Default**: All files are selected (`✅`).
+  - **Individual Toggles**: Select or deselect specific episodes/files with numbered buttons (`[ 1 ✅ ]`, `[ 2 ⬜ ]`).
+  - **Bulk Actions**: `[ Select All ✅ ]` and `[ Deselect All ⬜ ]`.
+  - **Pagination**: Navigate large torrents with `[ ◀ Prev ]` and `[ Next ▶ ]`.
+  - **Execution**: Tap `[ 🚀 Start Download ]` to download only selected files, or `[ Cancel ❌ ]` to abort.
 - **Single file torrent**: Uploaded directly to your Drive folder.
-- **Multi-file torrent** (e.g. TV seasons, music albums): The bot automatically creates a folder in Google Drive matching the torrent title, mirrors all files/subfolders, and shares the Google Drive folder link.
+- **Multi-file torrent**: Uploaded into a dedicated subfolder in Google Drive matching the torrent title.
 
 > **Requirement**: Make sure `aria2c` is installed on your VPS:
 > ```bash

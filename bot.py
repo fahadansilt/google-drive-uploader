@@ -151,6 +151,12 @@ class ActiveJob:
         self.task: Optional[asyncio.Task] = None
         self.clean_paths: list[str] = []
 
+        # Torrent multi-file selection state
+        self.torrent_files: list[dict] = []
+        self.selected_indices: set[int] = set()
+        self.page: int = 0
+        self.selection_event: asyncio.Event = asyncio.Event()
+
     def cancel(self, cancelled_by: Optional[int] = None):
         self.cancelled_by = cancelled_by
         self.cancel_event.set()
@@ -160,6 +166,85 @@ class ActiveJob:
 
 
 active_jobs: Dict[str, ActiveJob] = {}
+
+
+def render_file_selector(job: ActiveJob, page_size: int = 6) -> tuple[str, list[list[Button]]]:
+    """Render text and inline keyboard grid for interactive torrent file selection."""
+    files = job.torrent_files
+    total_files = len(files)
+    total_bytes = sum(int(f.get("length", 0)) for f in files)
+    selected_bytes = sum(
+        int(f.get("length", 0))
+        for f in files
+        if int(f.get("index", 1)) in job.selected_indices
+    )
+    total_pages = max(1, (total_files + page_size - 1) // page_size)
+    job.page = max(0, min(job.page, total_pages - 1))
+
+    start_idx = job.page * page_size
+    end_idx = min(start_idx + page_size, total_files)
+    page_files = files[start_idx:end_idx]
+
+    lines = [
+        "📂 **Select Files to Download**",
+        f"`{job.title}`",
+        f"**Total**: {total_files} files ({human(total_bytes)}) | **Selected**: {len(job.selected_indices)} ({human(selected_bytes)})\n",
+    ]
+
+    for f in page_files:
+        idx = int(f.get("index", 1))
+        icon = "✅" if idx in job.selected_indices else "⬜"
+        name = os.path.basename(f.get("path", f"file_{idx}"))
+        fsize = human(int(f.get("length", 0)))
+        lines.append(f"{idx}. {icon} `{safe_name(name, 'file')}` ({fsize})")
+
+    lines.append(f"\n📄 **Page {job.page + 1}/{total_pages}** (Files {start_idx + 1} - {end_idx} of {total_files})")
+
+    buttons = []
+
+    # 1. Numbered Toggle Buttons (3 per row)
+    toggle_row = []
+    for f in page_files:
+        idx = int(f.get("index", 1))
+        check = "✅" if idx in job.selected_indices else "⬜"
+        toggle_row.append(Button.inline(f"{idx} {check}", data=f"tsel:{job.job_id}:tog:{idx}"))
+        if len(toggle_row) == 3:
+            buttons.append(toggle_row)
+            toggle_row = []
+    if toggle_row:
+        buttons.append(toggle_row)
+
+    # 2. Pagination Buttons (if > 1 page)
+    if total_pages > 1:
+        prev_page = job.page - 1
+        next_page = job.page + 1
+        page_buttons = []
+        if job.page > 0:
+            page_buttons.append(Button.inline("◀ Prev", data=f"tsel:{job.job_id}:page:{prev_page}"))
+        else:
+            page_buttons.append(Button.inline("◀", data=f"tsel:{job.job_id}:noop"))
+
+        page_buttons.append(Button.inline(f"{job.page + 1}/{total_pages}", data=f"tsel:{job.job_id}:noop"))
+
+        if job.page < total_pages - 1:
+            page_buttons.append(Button.inline("Next ▶", data=f"tsel:{job.job_id}:page:{next_page}"))
+        else:
+            page_buttons.append(Button.inline("▶", data=f"tsel:{job.job_id}:noop"))
+        buttons.append(page_buttons)
+
+    # 3. Bulk Action Buttons
+    buttons.append([
+        Button.inline("Select All ✅", data=f"tsel:{job.job_id}:all"),
+        Button.inline("Deselect All ⬜", data=f"tsel:{job.job_id}:none"),
+    ])
+
+    # 4. Start & Cancel Buttons
+    buttons.append([
+        Button.inline(f"🚀 Start Download ({len(job.selected_indices)})", data=f"tsel:{job.job_id}:start"),
+        Button.inline("Cancel ❌", data=f"cancel:{job.job_id}"),
+    ])
+
+    return "\n".join(lines), buttons
 
 
 async def ticker(status_msg, prog, title, stop, job_id=None):
@@ -212,6 +297,29 @@ async def resolve_source(chat_id, msg_id, size):
             "the file. Move the upload to a shared group or channel."
         )
     return msg, "user"
+
+
+def clean_job_paths(paths: list[str]):
+    """Purge all files, directories, and partial temp files associated with a job."""
+    for p in paths:
+        if not p:
+            continue
+        try:
+            if os.path.exists(p):
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    os.remove(p)
+            # Check for partial/temp extensions
+            for ext in (".temp", ".part", ".aria2", ".crdownload"):
+                partial = p + ext
+                if os.path.exists(partial):
+                    if os.path.isdir(partial):
+                        shutil.rmtree(partial, ignore_errors=True)
+                    else:
+                        os.remove(partial)
+        except OSError as exc:
+            log.warning("could not remove %s: %s", p, exc)
 
 
 async def handle_tg_file_job(job: ActiveJob):
@@ -307,15 +415,7 @@ async def handle_tg_file_job(job: ActiveJob):
         except Exception:
             pass
     finally:
-        for p in job.clean_paths:
-            if os.path.exists(p):
-                try:
-                    if os.path.isdir(p):
-                        shutil.rmtree(p, ignore_errors=True)
-                    else:
-                        os.remove(p)
-                except OSError as exc:
-                    log.warning("could not remove %s: %s", p, exc)
+        clean_job_paths(job.clean_paths)
 
 
 async def handle_torrent_job(job: ActiveJob):
@@ -352,11 +452,53 @@ async def handle_torrent_job(job: ActiveJob):
             loop.call_soon_threadsafe(prog.update_torrent, stats)
 
         # 1. Download via aria2c
+        async def on_file_selection(files: list[dict], t_name: str) -> list[int]:
+            nonlocal tick
+            # Stop the progress ticker while user is interacting with the selector
+            stop.set()
+            if tick:
+                await tick
+                tick = None
+
+            job.torrent_files = files
+            job.title = t_name
+            # Default ALL files selected
+            job.selected_indices = {int(f.get("index", i + 1)) for i, f in enumerate(files)}
+            job.page = 0
+            job.selection_event.clear()
+
+            text, selector_buttons = render_file_selector(job)
+            await status.edit(text, buttons=selector_buttons)
+
+            # Wait until user confirms selection or cancels
+            sel_task = asyncio.create_task(job.selection_event.wait())
+            cancel_task = asyncio.create_task(job.cancel_event.wait())
+            try:
+                await asyncio.wait(
+                    [sel_task, cancel_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                if not sel_task.done():
+                    sel_task.cancel()
+                if not cancel_task.done():
+                    cancel_task.cancel()
+
+            if job.cancel_event.is_set():
+                raise TransferCancelled("Torrent download cancelled by user during file selection.")
+
+            # Selection confirmed - restart ticker
+            stop.clear()
+            prog.begin("downloading (torrent)", 0)
+            tick = asyncio.create_task(ticker(status, prog, job.title, stop, job.job_id))
+            return list(job.selected_indices)
+
         result = await torrent_manager.download(
             source,
             config.DOWNLOAD_DIR,
             progress_cb=on_torrent_progress,
             cancel_event=job.cancel_event,
+            file_selection_cb=on_file_selection,
         )
 
         target_path = result["path"]
@@ -438,15 +580,7 @@ async def handle_torrent_job(job: ActiveJob):
         except Exception:
             pass
     finally:
-        for p in job.clean_paths:
-            if os.path.exists(p):
-                try:
-                    if os.path.isdir(p):
-                        shutil.rmtree(p, ignore_errors=True)
-                    else:
-                        os.remove(p)
-                except OSError as exc:
-                    log.warning("could not remove %s: %s", p, exc)
+        clean_job_paths(job.clean_paths)
 
 
 async def worker():
@@ -460,15 +594,7 @@ async def worker():
                         await job.status_msg.edit(f"❌ **Cancelled (from queue)**\n`{job.title}`", buttons=None)
                     except Exception:
                         pass
-                for p in job.clean_paths:
-                    if os.path.exists(p):
-                        try:
-                            if os.path.isdir(p):
-                                shutil.rmtree(p, ignore_errors=True)
-                            else:
-                                os.remove(p)
-                        except OSError:
-                            pass
+                clean_job_paths(job.clean_paths)
                 continue
 
             job.task = asyncio.current_task()
@@ -479,6 +605,58 @@ async def worker():
         finally:
             active_jobs.pop(job.job_id, None)
             queue.task_done()
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^tsel:([^:]+):(.+)"))
+async def on_torrent_select_callback(event):
+    job_id = event.pattern_match.group(1).decode("utf-8")
+    action = event.pattern_match.group(2).decode("utf-8")
+
+    if not is_trusted(event):
+        await event.answer("Not authorised to modify this transfer.", alert=True)
+        return
+
+    job = active_jobs.get(job_id)
+    if not job or not job.torrent_files:
+        await event.answer("File selection is no longer active.", alert=True)
+        return
+
+    if action.startswith("tog:"):
+        idx = int(action.split(":")[1])
+        if idx in job.selected_indices:
+            job.selected_indices.remove(idx)
+        else:
+            job.selected_indices.add(idx)
+        await event.answer()
+    elif action.startswith("page:"):
+        target_page = int(action.split(":")[1])
+        job.page = target_page
+        await event.answer()
+    elif action == "all":
+        job.selected_indices = {int(f.get("index", i + 1)) for i, f in enumerate(job.torrent_files)}
+        await event.answer("All files selected.")
+    elif action == "none":
+        job.selected_indices.clear()
+        await event.answer("All files deselected.")
+    elif action == "start":
+        if not job.selected_indices:
+            await event.answer("⚠️ Please select at least 1 file to download!", alert=True)
+            return
+        job.selection_event.set()
+        await event.answer("🚀 Starting download...")
+        return
+    elif action == "noop":
+        await event.answer()
+        return
+
+    # Re-render selector and edit status message
+    text, buttons = render_file_selector(job)
+    try:
+        await job.status_msg.edit(text, buttons=buttons)
+    except (MessageNotModifiedError, FloodWaitError):
+        pass
+    except Exception as exc:
+        log.debug("Selector edit failed: %s", exc)
 
 
 @bot.on(events.CallbackQuery(pattern=rb"^cancel:(.+)"))

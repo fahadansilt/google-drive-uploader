@@ -191,14 +191,60 @@ class TorrentManager:
         except Exception:
             pass
 
+    def _cleanup_status_files(self, status_info: Optional[Dict[str, Any]], target_dir: str):
+        """Delete any partially downloaded files and .aria2 control files on disk."""
+        if not status_info:
+            return
+        files = status_info.get("files", [])
+        for f in files:
+            fpath = f.get("path")
+            if fpath:
+                if os.path.exists(fpath):
+                    try:
+                        if os.path.isdir(fpath):
+                            shutil.rmtree(fpath, ignore_errors=True)
+                        else:
+                            os.remove(fpath)
+                    except OSError:
+                        pass
+                aria2_ctl = fpath + ".aria2"
+                if os.path.exists(aria2_ctl):
+                    try:
+                        os.remove(aria2_ctl)
+                    except OSError:
+                        pass
+
+        bt_info = status_info.get("bittorrent", {}).get("info", {})
+        t_name = bt_info.get("name")
+        if t_name:
+            possible_dir = os.path.join(target_dir, t_name)
+            if os.path.exists(possible_dir):
+                try:
+                    if os.path.isdir(possible_dir):
+                        shutil.rmtree(possible_dir, ignore_errors=True)
+                    else:
+                        os.remove(possible_dir)
+                except OSError:
+                    pass
+            possible_aria2 = possible_dir + ".aria2"
+            if os.path.exists(possible_aria2):
+                try:
+                    os.remove(possible_aria2)
+                except OSError:
+                    pass
+
     async def download(
         self,
         magnet_or_path: str,
         download_dir: str,
         progress_cb: Optional[Callable[[Dict[str, Any]], None]] = None,
         cancel_event: Optional[asyncio.Event] = None,
+        file_selection_cb: Optional[Callable[[List[Dict[str, Any]], str], Any]] = None,
     ) -> Dict[str, Any]:
         """Download a magnet link or .torrent file, tracking progress and supporting cancellation.
+
+        If `file_selection_cb` is provided and the torrent has multiple files, aria2 pauses
+        and invokes the callback to allow selecting specific file indices before continuing.
 
         Returns a dictionary describing the completed download:
         {
@@ -223,6 +269,8 @@ class TorrentManager:
 
         log.info("Started aria2 torrent download with GID %s", gid)
         seen_gids = [gid]
+        last_status_info: Optional[Dict[str, Any]] = None
+        selection_completed = False
 
         try:
             while True:
@@ -230,9 +278,11 @@ class TorrentManager:
                     log.info("Download cancelled by user for GID %s", gid)
                     for g in seen_gids:
                         await self.force_remove(g)
+                    self._cleanup_status_files(last_status_info, target_dir)
                     raise TransferCancelled("Torrent download cancelled by user.")
 
                 status_info = await self.tell_status(gid)
+                last_status_info = status_info
                 status = status_info.get("status")
 
                 # Handle magnet metadata resolution (followedBy GID chain)
@@ -245,6 +295,47 @@ class TorrentManager:
                         seen_gids.append(gid)
                         continue
 
+                # Multi-file interactive selection trigger
+                files = status_info.get("files", [])
+                if (
+                    len(files) > 1
+                    and not selection_completed
+                    and file_selection_cb is not None
+                    and status in ("active", "waiting", "paused")
+                ):
+                    bt_info = status_info.get("bittorrent", {}).get("info", {})
+                    t_name = bt_info.get("name") or "Torrent"
+                    log.info("Multi-file torrent detected with %s files. Pausing for user selection...", len(files))
+
+                    try:
+                        await self._call("aria2.pause", [gid])
+                    except Exception as exc:
+                        log.debug("aria2.pause error (ignored): %s", exc)
+
+                    # Prompt user callback
+                    selected_indices = await file_selection_cb(files, t_name)
+
+                    if cancel_event and cancel_event.is_set():
+                        for g in seen_gids:
+                            await self.force_remove(g)
+                        self._cleanup_status_files(last_status_info, target_dir)
+                        raise TransferCancelled("Torrent download cancelled by user during file selection.")
+
+                    if not selected_indices:
+                        selected_indices = [int(f.get("index", i + 1)) for i, f in enumerate(files)]
+
+                    select_file_str = ",".join(str(idx) for idx in sorted(selected_indices))
+                    log.info("Applying select-file option: %s", select_file_str)
+                    await self._call("aria2.changeOption", [gid, {"select-file": select_file_str}])
+
+                    try:
+                        await self._call("aria2.unpause", [gid])
+                    except Exception as exc:
+                        log.debug("aria2.unpause error: %s", exc)
+
+                    selection_completed = True
+                    continue
+
                 if status == "complete":
                     log.info("Torrent download complete for GID %s", gid)
                     try:
@@ -256,13 +347,15 @@ class TorrentManager:
                 if status == "error":
                     err_msg = status_info.get("errorMessage", "Unknown aria2 error")
                     err_code = status_info.get("errorCode", "Unknown")
+                    self._cleanup_status_files(status_info, target_dir)
                     raise RuntimeError(f"Torrent download failed ({err_code}): {err_msg}")
 
                 if status == "removed":
+                    self._cleanup_status_files(status_info, target_dir)
                     raise TransferCancelled("Torrent download was removed.")
 
                 # Extract live metrics for progress callback
-                if progress_cb:
+                if progress_cb and (selection_completed or len(files) <= 1):
                     completed_len = int(status_info.get("completedLength", 0))
                     total_len = int(status_info.get("totalLength", 0))
                     dl_speed = int(status_info.get("downloadSpeed", 0))
@@ -273,7 +366,6 @@ class TorrentManager:
                     bt_info = status_info.get("bittorrent", {}).get("info", {})
                     name = bt_info.get("name")
                     if not name:
-                        files = status_info.get("files", [])
                         if files and files[0].get("path"):
                             name = os.path.basename(files[0]["path"])
                     if not name:
@@ -299,19 +391,29 @@ class TorrentManager:
                     await self.force_remove(g)
                 except Exception:
                     pass
+            self._cleanup_status_files(last_status_info, target_dir)
             raise
 
     def _parse_completed(self, status_info: Dict[str, Any], target_dir: str) -> Dict[str, Any]:
         bt_info = status_info.get("bittorrent", {}).get("info", {})
         torrent_name = bt_info.get("name")
         files = status_info.get("files", [])
-        total_size = int(status_info.get("totalLength", 0))
 
-        real_paths = [f["path"] for f in files if f.get("path") and os.path.exists(f["path"])]
+        # Filter only files that were selected and actually downloaded (size > 0 or existing non-empty)
+        real_paths = []
+        actual_size = 0
+        for f in files:
+            p = f.get("path")
+            if p and os.path.exists(p):
+                sz = os.path.getsize(p)
+                if sz > 0:
+                    real_paths.append(p)
+                    actual_size += sz
 
         if not real_paths:
             if torrent_name and os.path.exists(os.path.join(target_dir, torrent_name)):
                 real_paths = [os.path.join(target_dir, torrent_name)]
+                actual_size = int(status_info.get("totalLength", 0))
             else:
                 raise RuntimeError("Torrent completed but downloaded files could not be located.")
 
@@ -324,16 +426,17 @@ class TorrentManager:
                 "name": torrent_name,
                 "is_dir": True,
                 "path": possible_dir,
-                "total_size": total_size,
+                "total_size": actual_size,
                 "files": real_paths,
             }
 
+        # Single file
         primary_file = real_paths[0]
         return {
             "name": torrent_name,
             "is_dir": os.path.isdir(primary_file),
             "path": primary_file,
-            "total_size": total_size,
+            "total_size": actual_size,
             "files": real_paths,
         }
 
