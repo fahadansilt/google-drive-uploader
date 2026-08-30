@@ -94,6 +94,7 @@ class TorrentManager:
                 "--enable-peer-exchange=true",
                 "--bt-max-peers=60",
                 "--follow-torrent=mem",
+                "--file-allocation=none",
             ]
             if self.secret:
                 cmd.append(f"--rpc-secret={self.secret}")
@@ -166,7 +167,9 @@ class TorrentManager:
 
     async def add_magnet(self, magnet_uri: str, options: Optional[dict] = None) -> str:
         await self.ensure_running()
-        opts = options or {}
+        opts = {"file-allocation": "none"}
+        if options:
+            opts.update(options)
         gid = await self._call("aria2.addUri", [[magnet_uri], opts])
         return gid
 
@@ -174,7 +177,9 @@ class TorrentManager:
         await self.ensure_running()
         with open(torrent_path, "rb") as f:
             b64_content = base64.b64encode(f.read()).decode("utf-8")
-        opts = options or {}
+        opts = {"file-allocation": "none"}
+        if options:
+            opts.update(options)
         gid = await self._call("aria2.addTorrent", [b64_content, [], opts])
         return gid
 

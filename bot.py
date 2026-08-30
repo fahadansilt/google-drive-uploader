@@ -642,6 +642,27 @@ async def on_torrent_select_callback(event):
         if not job.selected_indices:
             await event.answer("⚠️ Please select at least 1 file to download!", alert=True)
             return
+
+        # Check VPS free disk space against selected files total size
+        selected_bytes = sum(
+            int(f.get("length", 0))
+            for f in job.torrent_files
+            if int(f.get("index", 1)) in job.selected_indices
+        )
+        try:
+            free = shutil.disk_usage(config.DOWNLOAD_DIR).free
+            if selected_bytes > 0 and free < selected_bytes * 1.02:
+                await event.answer(
+                    f"⚠️ Not enough VPS disk space!\n"
+                    f"Selected: {human(selected_bytes)}\n"
+                    f"Free Disk: {human(free)}\n\n"
+                    f"Please deselect some files or run /wipe.",
+                    alert=True,
+                )
+                return
+        except Exception:
+            pass
+
         job.selection_event.set()
         await event.answer("🚀 Starting download...")
         return
